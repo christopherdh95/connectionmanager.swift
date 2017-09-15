@@ -1,0 +1,205 @@
+//
+//  ConnectionMonitor.swift
+//  Mixpool
+//
+//  This class will monitor whether a device is still reachable on the network.
+//  It will send a notification for every connection drop.
+//
+//  Created by Tommy Ha on 12/5/16.
+//  Copyright © 2016 Parsable, Inc. All rights reserved.
+//
+import UIKit
+
+class ConnectionMonitor: NSObject {
+    static let USER_INFO_KEY_REMOTE = "remoteHandle"
+    
+    static let instance = ConnectionMonitor(intervalSecs: 10)
+
+    static let DeviceNotReachableNotification:  Notification.Name = Notification.Name(rawValue: "com.parsable.device.not.reachable")
+    
+    let minimumActivityThreshold: TimeInterval = 30
+    var lastVerifyTimer: Timer?
+
+    // it should only take a few secs to perform initial connect
+    let connectTimeout: TimeInterval = 6
+    var checkInterval: Double!
+    var timer: Timer?
+    var remoteHandles = Array<RemoteHandle>()
+    let lock = NSLock()
+    
+    // have a separate timer to monitor last verified, in case the connect hangs
+    var lastVerified = [String : Date]()
+    
+    init(intervalSecs: Double) {
+        if intervalSecs > 0 {
+            checkInterval = intervalSecs
+        }
+    }
+    
+    func addMonitor(_ remote: RemoteHandle) {
+        guard let ip = remote.ipAddress, let remotePort = remote.remotePort else {
+            DDLogError("No ip /port given")
+            return
+        }
+        lastVerified[ip] = Date()
+
+        lock.lock()
+
+        let existing = remoteHandleForIp(ip, port: remotePort)
+        if existing == nil {
+            remoteHandles.append(remote)
+            if self.timer == nil {
+                DispatchQueue.main.async {
+                    self.timer = Timer.scheduledTimer(timeInterval: self.checkInterval, target: self, selector: #selector(self.validateConns(_:)), userInfo: nil, repeats: true)
+                }
+            }
+            if self.lastVerifyTimer == nil {
+                DispatchQueue.main.async {
+                    self.lastVerifyTimer = Timer.scheduledTimer(timeInterval: self.checkInterval/2, target: self, selector: #selector(self.checkLastVerified(_:)), userInfo: nil, repeats: true)
+                }
+            }
+        }
+        lock.unlock()
+    }
+    
+    func remoteHandleForIp(_ ipAddress: String, port: Int) -> RemoteHandle? {
+        for rh in remoteHandles {
+            if let ip = rh.ipAddress, let remotePort = rh.remotePort {
+                if ip == ipAddress && remotePort == port {
+                    return rh
+                }
+            }
+        }
+        return nil
+    }
+
+    func disconnectIPAddress(_ ipAddress: String) {
+        var list = Array<RemoteHandle>()
+        for remote in remoteHandles {
+            if remote.ipAddress != nil && remote.ipAddress! == ipAddress {
+                list.append(remote)
+            }
+        }
+        DDLogDebug("there are \(list.count) handles to IP \(ipAddress)")
+        for remote in list {
+            removeHandle(remote)
+        }
+    }
+    
+    func removeHandle(_ handle: RemoteHandle) {
+        lock.lock()
+        if let idx = remoteHandles.index(of: handle) {
+            handle.connectionStatus = .unknown
+            self.remoteHandles.remove(at: idx)
+        }
+        if self.remoteHandles.isEmpty {
+            if let checkTimer = self.timer {
+                DDLogDebug("no more handles, disabling timer")
+                checkTimer.invalidate()
+                self.timer = nil
+            }
+        }
+        handle.closeStreams()
+        lock.unlock()
+    }
+    
+    func startMonitoring() {
+        stopMonitoring()
+    }
+    
+    func stopMonitoring() {
+        lock.lock()
+        if let timer = timer {
+            timer.invalidate()
+            self.timer = nil
+        }
+        if let timer = self.lastVerifyTimer {
+            timer.invalidate()
+            self.lastVerifyTimer = nil
+        }
+        for remote: RemoteHandle in remoteHandles {
+            remote.closeStreams()
+        }
+        self.remoteHandles.removeAll()
+        lock.unlock()
+    }
+    
+    func validateConns(_ timer: Timer) -> Void {
+        //DDLogDebug("validateConns() timer fired - \(Date()); time=\(timer) ; #of remotes to check \(remoteHandles.count)")
+        DispatchQueue.global().async {
+            let instance = ConnectionMonitor.instance
+            for remote in instance.remoteHandles {
+                if instance.shouldValidateNow(remote: remote) {
+                    instance.validateRemoteConnection(remote)
+                }
+            }
+        }
+    }
+    
+    func checkLastVerified(_ timer: Timer) -> Void {
+        let currentConns = Array<RemoteHandle>(remoteHandles)
+        let now = Date().timeIntervalSince1970
+        for rh in currentConns {
+            if let lastDate:Date = lastVerified[rh.ipAddress!] {
+                let since = now - lastDate.timeIntervalSince1970
+                if since > minimumActivityThreshold {
+                    DDLogWarn("It's been \(since) secs since last check ip \(rh.ipAddress)")
+//                    NotificationCenter.default.post(name: ConnectionMonitor.DeviceNotReachableNotification, object: self, userInfo: [ConnectionMonitor.USER_INFO_KEY_REMOTE : rh])
+                }
+            }
+        }
+    }
+
+    func validateRemoteConnection(_ remote: RemoteHandle) {
+        var canConnect:Bool = false
+        if let ip = remote.remoteHeader?.ipAddress, let port = remote.remoteHeader?.port {
+            DDLogDebug("revalidating peer at \(ip), port \(port)")
+            canConnect = connectableViaThrift(ip: ip, port: Int(port))
+        } else {
+            DDLogDebug("remote handle does not have remote mesh header!!")
+        }
+        remote.lastValidated = Date()
+        DDLogDebug("device at \(remote.remoteHeader?.ipAddress) still connectable? \(canConnect)")
+        if !canConnect {
+            remote.connectionStatus = .disconnected
+            remote.closeStreams()
+            lock.lock()
+            if let idx = remoteHandles.index(of: remote) {
+                remoteHandles.remove(at: idx)
+            }
+            lock.unlock()
+            NotificationCenter.default.post(name: ConnectionMonitor.DeviceNotReachableNotification, object: self, userInfo: [ConnectionMonitor.USER_INFO_KEY_REMOTE : remote])
+        }
+        if self.remoteHandles.isEmpty {
+            stopMonitoring()
+        }
+    }
+
+    fileprivate func shouldValidateNow(remote: RemoteHandle) -> Bool {
+        return (remote.lastValidated.timeIntervalSince1970 + checkInterval) < Date().timeIntervalSince1970
+    }
+
+    fileprivate func updateLastVerified(_ ipAddress: String) {
+        lastVerified[ipAddress] = Date()
+    }
+
+    fileprivate func connectableViaThrift(ip: String, port: Int) -> Bool {
+        let client = ClientHandle(address: ip, port: port)
+        var success = false
+        do {
+            try client.connectWithTimeout(connectTimeout, callback: nil)
+            DDLogDebug("connectableViaThrift to IP \(ip):\(port) success - \(Date())")
+            success = true
+            updateLastVerified(ip)
+        } catch {
+            DDLogDebug("Got error connecting to \(ip) : \(port)")
+        }
+        
+        DDLogDebug("connectableViaThrift to IP \(ip):\(port) success? \(success) - \(Date())")
+        return success
+    }
+    
+    func ping(ip: String) -> Bool {
+        return false
+    }
+}
